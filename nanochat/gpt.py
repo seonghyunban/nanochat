@@ -4,11 +4,12 @@ Notable features:
 - rotary embeddings (and no positional embeddings)
 - QK norm
 - untied weights for token embedding and lm_head
-- relu^2 activation in MLP
+- configurable relu^2 / SwiGLU MLP
 - norm after token embedding
 - no learnable params in rmsnorm
 - no bias in linear layers
 - Group-Query Attention (GQA) support for more efficient inference
+- optional LayerScale residual gating
 - Flash Attention 3 integration
 """
 
@@ -37,6 +38,9 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (half context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    mlp_variant: str = "relu2"
+    residual_variant: str = "standard"
+    layerscale_init: float = 1e-4
 
 
 def norm(x):
@@ -121,12 +125,29 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        self.variant = config.mlp_variant
+        if self.variant == "relu2":
+            hidden_dim = 4 * config.n_embd
+            self.c_fc = nn.Linear(config.n_embd, hidden_dim, bias=False)
+            self.c_gate = None
+            self.c_proj = nn.Linear(hidden_dim, config.n_embd, bias=False)
+        elif self.variant == "swiglu":
+            # SwiGLU uses three matrices, so shrink the hidden width to keep parameter count similar.
+            hidden_dim = (8 * config.n_embd + 2) // 3
+            self.c_fc = nn.Linear(config.n_embd, hidden_dim, bias=False)
+            self.c_gate = nn.Linear(config.n_embd, hidden_dim, bias=False)
+            self.c_proj = nn.Linear(hidden_dim, config.n_embd, bias=False)
+        else:
+            raise ValueError(f"Unsupported mlp_variant: {self.variant}")
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = F.relu(x).square()
+        if self.variant == "relu2":
+            x = self.c_fc(x)
+            x = F.relu(x).square()
+        elif self.variant == "swiglu":
+            x = F.silu(self.c_fc(x)) * self.c_gate(x)
+        else:
+            raise RuntimeError(f"Unsupported mlp_variant at runtime: {self.variant}")
         x = self.c_proj(x)
         return x
 
@@ -134,12 +155,28 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
+        self.residual_variant = config.residual_variant
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
+        if self.residual_variant == "layerscale":
+            self.attn_scale = nn.Parameter(torch.ones(()))
+            self.mlp_scale = nn.Parameter(torch.ones(()))
+        elif self.residual_variant == "standard":
+            self.attn_scale = None
+            self.mlp_scale = None
+        else:
+            raise ValueError(f"Unsupported residual_variant: {self.residual_variant}")
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
-        x = x + self.mlp(norm(x))
+        attn_out = self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+        if self.attn_scale is not None:
+            attn_out = self.attn_scale * attn_out
+        x = x + attn_out
+
+        mlp_out = self.mlp(norm(x))
+        if self.mlp_scale is not None:
+            mlp_out = self.mlp_scale * mlp_out
+        x = x + mlp_out
         return x
 
 
@@ -198,7 +235,10 @@ class GPT(nn.Module):
             attn.c_v:        uniform, std=1/sqrt(n_embd)
             attn.c_proj:     zeros
             mlp.c_fc:        uniform, std=1/sqrt(n_embd)
+            mlp.c_gate:      uniform, std=1/sqrt(n_embd)   (SwiGLU only)
             mlp.c_proj:      zeros
+            attn_scale:      layerscale_init               (LayerScale only)
+            mlp_scale:       layerscale_init               (LayerScale only)
         """
 
         # Embedding and unembedding
@@ -214,7 +254,12 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
+            if block.mlp.c_gate is not None:
+                torch.nn.init.uniform_(block.mlp.c_gate.weight, -s, s)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            if block.attn_scale is not None:
+                block.attn_scale.fill_(self.config.layerscale_init)
+                block.mlp_scale.fill_(self.config.layerscale_init)
 
         # Per-layer scalars
         self.resid_lambdas.fill_(1.0)   # 1.0 => typical residual connections at init
@@ -304,8 +349,14 @@ class GPT(nn.Module):
         nparams = sum(p.numel() for p in self.parameters())
         # Exclude non-matmul params: embeddings and per-layer scalars
         value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
+        block_scalar_numel = sum(
+            p.numel()
+            for block in self.transformer.h
+            for name, p in block.named_parameters()
+            if name in {"attn_scale", "mlp_scale"}
+        )
         nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
-                          self.resid_lambdas.numel() + self.x0_lambdas.numel())
+                          self.resid_lambdas.numel() + self.x0_lambdas.numel() + block_scalar_numel)
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Sum attention FLOPs per layer, accounting for sliding window
         attn_flops = 0
@@ -332,8 +383,15 @@ class GPT(nn.Module):
         wte = sum(p.numel() for p in self.transformer.wte.parameters())
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
-        transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
-        scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
+        transformer_matrices = 0
+        block_scalars = 0
+        for block in self.transformer.h:
+            for name, p in block.named_parameters():
+                if name in {"attn_scale", "mlp_scale"}:
+                    block_scalars += p.numel()
+                else:
+                    transformer_matrices += p.numel()
+        scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + block_scalars
         total = wte + value_embeds + lm_head + transformer_matrices + scalars
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         return {
@@ -350,13 +408,22 @@ class GPT(nn.Module):
         ddp, rank, local_rank, world_size = get_dist_info()
 
         # Separate out all parameters into groups
-        matrix_params = list(self.transformer.h.parameters())
+        matrix_params = []
+        block_scalar_params = []
+        for block in self.transformer.h:
+            for name, p in block.named_parameters():
+                if name in {"attn_scale", "mlp_scale"}:
+                    block_scalar_params.append(p)
+                else:
+                    matrix_params.append(p)
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params)
+        grouped_params = matrix_params + value_embeds_params + embedding_params + lm_head_params + resid_params + x0_params + block_scalar_params
+        assert len(list(self.parameters())) == len(grouped_params)
+        assert len({id(p) for p in grouped_params}) == len(grouped_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -370,6 +437,7 @@ class GPT(nn.Module):
             dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
+            dict(kind='adamw', params=block_scalar_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
         ]
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
