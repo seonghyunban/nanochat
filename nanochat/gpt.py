@@ -213,9 +213,8 @@ class GPT(nn.Module):
         kv_dim = config.n_kv_head * head_dim
         self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
-        # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
-        # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
-        # In the future we can dynamically grow the cache, for now it's fine.
+        # As for rotary_seq_len, these rotary embeddings are small/cheap in memory,
+        # so we precompute by 10X and dynamically grow later if needed.
         self.rotary_seq_len = config.sequence_len * 10 # 10X over-compute should be enough, TODO make nicer?
         head_dim = config.n_embd // config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
@@ -301,6 +300,18 @@ class GPT(nn.Module):
         cos, sin = cos.bfloat16(), sin.bfloat16() # keep them in bfloat16
         cos, sin = cos[None, :, None, :], sin[None, :, None, :] # add batch and head dims for later broadcasting
         return cos, sin
+
+    def _ensure_rotary_cache(self, required_seq_len):
+        """Grow rotary cache on demand for long-context eval/inference."""
+        if required_seq_len <= self.cos.size(1):
+            return
+        old_len = self.cos.size(1)
+        new_len = max(required_seq_len, old_len * 2)
+        head_dim = self.config.n_embd // self.config.n_head
+        cos, sin = self._precompute_rotary_embeddings(new_len, head_dim, device=self.transformer.wte.weight.device)
+        self.cos, self.sin = cos, sin
+        self.rotary_seq_len = new_len
+        print0(f"Growing rotary embeddings cache from {old_len} to {new_len}")
 
     def _compute_window_sizes(self, config):
         """
@@ -457,12 +468,16 @@ class GPT(nn.Module):
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
-        assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
+        # if kv cache exists, we need to offset rotary embeddings to the current position in the cache
+        T0 = 0 if kv_cache is None else kv_cache.get_pos()
+        required_seq_len = T0 + T
+        self._ensure_rotary_cache(required_seq_len)
+        assert required_seq_len <= self.cos.size(1), (
+            f"Sequence length grew beyond the rotary embeddings cache: {required_seq_len} > {self.cos.size(1)}"
+        )
         assert idx.device == self.cos.device, f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
         assert self.cos.dtype == torch.bfloat16, "Rotary embeddings must be in bfloat16"
-        # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
-        T0 = 0 if kv_cache is None else kv_cache.get_pos()
-        cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
+        cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # slice cache to current positions
 
         # Forward the trunk of the Transformer
         x = self.transformer.wte(idx) # embed current token
