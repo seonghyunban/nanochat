@@ -4,7 +4,7 @@ Notable features:
 - rotary embeddings (and no positional embeddings)
 - QK norm
 - untied weights for token embedding and lm_head
-- relu^2 activation in MLP
+- configurable relu^2 / SwiGLU MLP
 - norm after token embedding
 - no learnable params in rmsnorm
 - no bias in linear layers
@@ -37,6 +37,7 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (half context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    mlp_variant: str = "relu2"
 
 
 def norm(x):
@@ -121,12 +122,29 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        self.variant = config.mlp_variant
+        if self.variant == "relu2":
+            hidden_dim = 4 * config.n_embd
+            self.c_fc = nn.Linear(config.n_embd, hidden_dim, bias=False)
+            self.c_gate = None
+            self.c_proj = nn.Linear(hidden_dim, config.n_embd, bias=False)
+        elif self.variant == "swiglu":
+            # SwiGLU uses three matrices, so shrink the hidden width to keep parameter count similar.
+            hidden_dim = (8 * config.n_embd + 2) // 3
+            self.c_fc = nn.Linear(config.n_embd, hidden_dim, bias=False)
+            self.c_gate = nn.Linear(config.n_embd, hidden_dim, bias=False)
+            self.c_proj = nn.Linear(hidden_dim, config.n_embd, bias=False)
+        else:
+            raise ValueError(f"Unsupported mlp_variant: {self.variant}")
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = F.relu(x).square()
+        if self.variant == "relu2":
+            x = self.c_fc(x)
+            x = F.relu(x).square()
+        elif self.variant == "swiglu":
+            x = F.silu(self.c_fc(x)) * self.c_gate(x)
+        else:
+            raise RuntimeError(f"Unsupported mlp_variant at runtime: {self.variant}")
         x = self.c_proj(x)
         return x
 
@@ -198,6 +216,7 @@ class GPT(nn.Module):
             attn.c_v:        uniform, std=1/sqrt(n_embd)
             attn.c_proj:     zeros
             mlp.c_fc:        uniform, std=1/sqrt(n_embd)
+            mlp.c_gate:      uniform, std=1/sqrt(n_embd)   (SwiGLU only)
             mlp.c_proj:      zeros
         """
 
@@ -214,6 +233,8 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
+            if block.mlp.c_gate is not None:
+                torch.nn.init.uniform_(block.mlp.c_gate.weight, -s, s)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
 
         # Per-layer scalars
