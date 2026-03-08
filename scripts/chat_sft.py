@@ -236,7 +236,7 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
                     f"epoch={epoch}, it={it}"
                 )
             conversation = dataset[cursor]
-            ids, mask = tokenizer.render_conversation(conversation)
+            ids, mask = tokenizer.render_conversation(conversation, max_tokens=row_capacity)
             assert len(ids) == len(mask), "Token ids and supervision mask must be same length"
             conv_buffer.append((ids, mask))
             cursor += ddp_world_size
