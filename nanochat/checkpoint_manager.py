@@ -20,12 +20,30 @@ def log0(message):
     if int(os.environ.get('RANK', 0)) == 0:
         logger.info(message)
 
-def _patch_missing_config_keys(model_config_kwargs):
+def _patch_missing_config_keys(model_config_kwargs, model_data=None):
     """Add default values for new config keys missing in old checkpoints."""
     # Old models were trained with full context (no sliding window)
     if "window_pattern" not in model_config_kwargs:
         model_config_kwargs["window_pattern"] = "L"
         log0(f"Patching missing window_pattern in model config to 'L'")
+    if "mlp_variant" not in model_config_kwargs:
+        if model_data is not None and any(k.endswith(".mlp.c_gate.weight") for k in model_data):
+            model_config_kwargs["mlp_variant"] = "swiglu"
+            log0("Patching missing mlp_variant in model config to 'swiglu'")
+        else:
+            model_config_kwargs["mlp_variant"] = "relu2"
+            log0("Patching missing mlp_variant in model config to 'relu2'")
+    if "residual_variant" not in model_config_kwargs:
+        has_layerscale = any(
+            k.endswith(".attn_scale") or k.endswith(".mlp_scale") for k in (model_data or {})
+        )
+        model_config_kwargs["residual_variant"] = "layerscale" if has_layerscale else "standard"
+        log0(
+            "Patching missing residual_variant in model config to "
+            f"'{model_config_kwargs['residual_variant']}'"
+        )
+    if "layerscale_init" not in model_config_kwargs:
+        model_config_kwargs["layerscale_init"] = 1e-4
 
 def _patch_missing_keys(model_data, model_config):
     """Add default values for new parameters that may be missing in old checkpoints."""
@@ -93,7 +111,7 @@ def build_model(checkpoint_dir, step, device, phase):
     # Hack: fix torch compile issue, which prepends all keys with _orig_mod.
     model_data = {k.removeprefix("_orig_mod."): v for k, v in model_data.items()}
     model_config_kwargs = meta_data["model_config"]
-    _patch_missing_config_keys(model_config_kwargs)
+    _patch_missing_config_keys(model_config_kwargs, model_data=model_data)
     log0(f"Building model with config: {model_config_kwargs}")
     model_config = GPTConfig(**model_config_kwargs)
     _patch_missing_keys(model_data, model_config)

@@ -473,6 +473,9 @@ while True:
                     "n_kv_head": model.config.n_kv_head,
                     "n_embd": model.config.n_embd,
                     "window_pattern": model.config.window_pattern,
+                    "mlp_variant": model.config.mlp_variant,
+                    "residual_variant": model.config.residual_variant,
+                    "layerscale_init": model.config.layerscale_init,
                 },
                 "user_config": user_config, # inputs to the training script
             },
