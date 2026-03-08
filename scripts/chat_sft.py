@@ -44,6 +44,9 @@ parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (e
 parser.add_argument("--model-tag", type=str, default=None, help="model tag to load from")
 parser.add_argument("--model-step", type=int, default=None, help="model step to load from")
 parser.add_argument("--load-optimizer", type=int, default=1, help="warm-start optimizer from pretrained checkpoint (0=no, 1=yes)")
+parser.add_argument("--resume-from-source", type=str, default="", help="resume source checkpoint family: base|sft|rl")
+parser.add_argument("--resume-from-tag", type=str, default="", help="resume training from an existing checkpoint tag")
+parser.add_argument("--resume-from-step", type=int, default=None, help="resume training from an existing checkpoint step")
 # Training horizon
 parser.add_argument("--num-iterations", type=int, default=-1, help="number of optimization steps (-1 = full epoch)")
 parser.add_argument("--disable-compile", type=int, default=0, help="disable torch.compile for debugging/smoke runs")
@@ -102,8 +105,34 @@ wandb_run = (
 if not HAS_FA3:
     print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback. Training will be less efficient.")
 
+resume_enabled = bool(args.resume_from_tag)
+if resume_enabled and args.resume_from_step is None:
+    raise ValueError("--resume-from-step is required when --resume-from-tag is provided")
+if args.resume_from_step is not None and not resume_enabled:
+    raise ValueError("--resume-from-tag is required when --resume-from-step is provided")
+if args.resume_from_source and not resume_enabled:
+    raise ValueError("--resume-from-tag is required when --resume-from-source is provided")
+resume_source = args.resume_from_source or "sft"
+if resume_source not in {"base", "sft", "rl"}:
+    raise ValueError(f"Invalid --resume-from-source={resume_source!r}; expected base|sft|rl")
+
+load_source = resume_source if resume_enabled else "base"
+load_tag = args.resume_from_tag if resume_enabled else args.model_tag
+load_step = args.resume_from_step if resume_enabled else args.model_step
+resume_step = load_step if resume_enabled else 0
+if args.num_iterations > 0 and resume_step >= args.num_iterations:
+    raise ValueError(
+        f"Resume step {resume_step} is already >= requested num_iterations {args.num_iterations}"
+    )
+
+if resume_enabled:
+    print0(
+        f"Resuming SFT from {load_source}:{load_tag}@{load_step} "
+        f"-> output tag {args.model_tag or load_tag}"
+    )
+
 # Load the model and tokenizer
-model, tokenizer, meta = load_model("base", device, phase="train", model_tag=args.model_tag, step=args.model_step)
+model, tokenizer, meta = load_model(load_source, device, phase="train", model_tag=load_tag, step=load_step)
 
 # Inherit training hyperparameters from pretrained checkpoint (None = inherit, explicit value = override)
 pretrain_user_config = meta.get("user_config", {})
@@ -153,16 +182,16 @@ optimizer = model.setup_optimizer(unembedding_lr=args.unembedding_lr, embedding_
 # restore our fresh SFT LRs after loading.
 base_dir = get_base_dir()
 if args.load_optimizer:
-    optimizer_data = load_optimizer_state("base", device, rank=ddp_rank, model_tag=args.model_tag, step=args.model_step)
+    optimizer_data = load_optimizer_state(load_source, device, rank=ddp_rank, model_tag=load_tag, step=load_step)
     if optimizer_data is not None:
         base_lrs = [group["lr"] for group in optimizer.param_groups]
         optimizer.load_state_dict(optimizer_data)
         del optimizer_data
         for group, base_lr in zip(optimizer.param_groups, base_lrs):
             group["lr"] = base_lr
-        print0("Loaded optimizer state from pretrained checkpoint (momentum buffers only, LRs reset)")
+        print0(f"Loaded optimizer state from {load_source} checkpoint (momentum buffers only, LRs reset)")
     else:
-        print0("WARNING: optimizer checkpoint not found, starting with fresh optimizer (slightly worse)")
+        print0(f"WARNING: optimizer checkpoint not found in {load_source}, starting with fresh optimizer")
 
 # Override the initial learning rate as a fraction of the base learning rate
 for group in optimizer.param_groups:
@@ -304,14 +333,15 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
 
         # Stopping condition to respect num_iterations, if given
         it += 1
-        if 0 < args.num_iterations <= it and split == "train":
+        global_step = resume_step + it
+        if 0 < args.num_iterations <= global_step and split == "train":
             last_step = True
 
         # Update progress tracking (based on consumed, not cursor, to account for buffering)
         if split == "train":
             current_epoch = epoch
             if args.num_iterations > 0:
-                approx_progress = it / args.num_iterations
+                approx_progress = global_step / args.num_iterations
             else:
                 approx_progress = consumed / dataset_size
             # Trigger last_step when we've consumed enough (instead of when cursor wraps)
@@ -419,7 +449,7 @@ min_val_bpb = float("inf")
 smooth_train_loss = 0 # EMA of training loss
 ema_beta = 0.9 # EMA decay factor
 total_training_time = 0 # total wall-clock time of training
-step = 0
+step = resume_step
 while True:
     flops_so_far = num_flops_per_token * args.total_batch_size * step
 
