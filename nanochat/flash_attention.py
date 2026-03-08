@@ -13,6 +13,7 @@ Usage (drop-in replacement for FA3):
     # Inference (with KV cache)
     y = flash_attn.flash_attn_with_kvcache(q, k_cache, v_cache, k=k, v=v, ...)
 """
+import os
 import torch
 import torch.nn.functional as F
 
@@ -41,8 +42,12 @@ def _load_flash_attention_3():
 _fa3 = _load_flash_attention_3()
 HAS_FA3 = _fa3 is not None
 
-# Override for testing: set to 'fa3', 'sdpa', or None (auto)
-_override_impl = None
+# Override for testing/runtime: set to 'fa3', 'sdpa', or None (auto)
+_override_impl = os.environ.get("NANOCHAT_FLASH_IMPL")
+if _override_impl not in {None, "fa3", "sdpa"}:
+    raise ValueError(
+        f"Invalid NANOCHAT_FLASH_IMPL={_override_impl!r}; expected 'fa3', 'sdpa', or unset"
+    )
 
 
 def _use_fa3():
