@@ -72,8 +72,10 @@ user_config = vars(args).copy()
 # -----------------------------------------------------------------------------
 
 # Compute init
+print("[debug] starting compute_init")
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
+print("[debug] compute_init finished")
 master_process = ddp_rank == 0
 autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == "cuda" else nullcontext()
 synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
@@ -162,6 +164,7 @@ for group in optimizer.param_groups:
     group["initial_lr"] = group["lr"]
 
 # SFT data mixture and DataLoader
+print0("[debug] building SFT train task list")
 identity_conversations_filepath = os.path.join(base_dir, "identity_conversations.jsonl")
 train_tasks = [
     SmolTalk(split="train"), # 460K rows of general conversations
@@ -172,8 +175,10 @@ train_tasks = [
     SimpleSpelling(size=200000, split="train"), # 200K rows of Simple Spelling (e.g. spell the word 'apple')
     SpellingBee(size=80000, split="train"), # 80K rows of Spelling Bee (e.g. how many 'r' are in 'strawberry'?)
 ]
+print0("[debug] constructing train TaskMixture")
 train_dataset = TaskMixture(train_tasks)
 print0(f"Training mixture: {len(train_dataset):,} rows (MMLU x{args.mmlu_epochs}, GSM8K x{args.gsm8k_epochs})")
+print0("[debug] constructing val TaskMixture")
 val_dataset = TaskMixture([
     SmolTalk(split="test"), # 24K rows in test set
     MMLU(subset="all", split="test", stop=5200), # 14K rows in test set, use only 5.2K to match the train ratios
@@ -311,7 +316,9 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
 
         yield inputs, targets
 
+print0("[debug] creating train_loader")
 train_loader = sft_data_generator_bos_bestfit("train")
+print0("[debug] train_loader created")
 build_val_loader = lambda: sft_data_generator_bos_bestfit("val")
 progress = 0 # will go from 0 to 1 over the course of the epoch
 
@@ -335,7 +342,9 @@ def get_muon_momentum(it):
 
 # -----------------------------------------------------------------------------
 # Training loop
+print0("[debug] getting first batch")
 x, y = next(train_loader) # prefetch the very first batch of data
+print0("[debug] first batch ready")
 min_val_bpb = float("inf")
 smooth_train_loss = 0 # EMA of training loss
 ema_beta = 0.9 # EMA decay factor
