@@ -202,7 +202,7 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
     row_capacity = args.max_seq_len + 1  # +1 for target at last position
     bos_token = tokenizer.get_bos_token_id()
 
-    # Conversation buffer: list of token lists
+    # Conversation buffer: list of (token_ids, supervision_mask) pairs
     conv_buffer = []
     cursor = ddp_rank  # Each rank processes different conversations (for fetching)
     consumed = ddp_rank  # Track actual consumption separately from buffering
@@ -213,8 +213,9 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
         nonlocal cursor, epoch
         while len(conv_buffer) < buffer_size:
             conversation = dataset[cursor]
-            ids, _ = tokenizer.render_conversation(conversation)
-            conv_buffer.append(ids)
+            ids, mask = tokenizer.render_conversation(conversation)
+            assert len(ids) == len(mask), "Token ids and supervision mask must be same length"
+            conv_buffer.append((ids, mask))
             cursor += ddp_world_size
             if cursor >= dataset_size:
                 cursor = cursor % dataset_size
@@ -223,9 +224,11 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
 
     while True:
         rows = []
+        row_masks = []
         row_lengths = []  # Track actual content length (excluding padding) for each row
         for _ in range(args.device_batch_size):
             row = []
+            row_mask = []
             padded = False
             while len(row) < row_capacity:
                 # Ensure buffer has conversations
@@ -237,22 +240,24 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
                 # Find largest conversation that fits entirely
                 best_idx = -1
                 best_len = 0
-                for i, conv in enumerate(conv_buffer):
-                    conv_len = len(conv)
+                for i, (conv_ids, _conv_mask) in enumerate(conv_buffer):
+                    conv_len = len(conv_ids)
                     if conv_len <= remaining and conv_len > best_len:
                         best_idx = i
                         best_len = conv_len
 
                 if best_idx >= 0:
                     # Found a conversation that fits - use it entirely
-                    conv = conv_buffer.pop(best_idx)
-                    row.extend(conv)
+                    conv_ids, conv_mask = conv_buffer.pop(best_idx)
+                    row.extend(conv_ids)
+                    row_mask.extend(conv_mask)
                     consumed += ddp_world_size  # Track actual consumption
                 else:
                     # No conversation fits - pad the remainder instead of cropping
                     # This ensures we never discard any tokens
                     content_len = len(row)
                     row.extend([bos_token] * remaining)  # Pad with BOS tokens
+                    row_mask.extend([0] * remaining)
                     padded = True
                     break  # Row is now full (with padding)
 
@@ -262,6 +267,7 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
             else:
                 row_lengths.append(row_capacity)
             rows.append(row[:row_capacity])
+            row_masks.append(row_mask[:row_capacity])
 
         # Stopping condition to respect num_iterations, if given
         it += 1
@@ -282,8 +288,13 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
         # Build tensors
         use_cuda = device_type == "cuda"
         batch_tensor = torch.tensor(rows, dtype=torch.long, pin_memory=use_cuda)
+        mask_tensor = torch.tensor(row_masks, dtype=torch.bool, pin_memory=use_cuda)
         inputs = batch_tensor[:, :-1].to(device=device, dtype=torch.int32, non_blocking=use_cuda)
         targets = batch_tensor[:, 1:].to(device=device, dtype=torch.int64, non_blocking=use_cuda)
+        target_mask = mask_tensor[:, 1:].to(device=device, non_blocking=use_cuda)
+
+        # Only assistant-side tokens should contribute to the SFT loss.
+        targets = targets.masked_fill(~target_mask, -1)
 
         # Mask out padding positions in targets (set to -1 = ignore_index)
         # For each row, positions >= (content_length - 1) in targets should be masked
