@@ -218,10 +218,23 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
     consumed = ddp_rank  # Track actual consumption separately from buffering
     epoch = 1
     it = 0  # iteration counter
+    empty_supervision_skips = 0
+    max_refill_iters = max(buffer_size * 10, 1000)
+    max_row_iters = max(row_capacity * 4, 2048)
 
     def refill_buffer():
         nonlocal cursor, epoch
+        refill_iters = 0
+        start_len = len(conv_buffer)
         while len(conv_buffer) < buffer_size:
+            refill_iters += 1
+            if refill_iters > max_refill_iters:
+                raise RuntimeError(
+                    "SFT dataloader stuck while refilling conversation buffer: "
+                    f"split={split}, start_len={start_len}, current_len={len(conv_buffer)}, "
+                    f"buffer_size={buffer_size}, cursor={cursor}, dataset_size={dataset_size}, "
+                    f"epoch={epoch}, it={it}"
+                )
             conversation = dataset[cursor]
             ids, mask = tokenizer.render_conversation(conversation)
             assert len(ids) == len(mask), "Token ids and supervision mask must be same length"
@@ -240,7 +253,16 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
             row = []
             row_mask = []
             padded = False
+            row_iters = 0
             while len(row) < row_capacity:
+                row_iters += 1
+                if row_iters > max_row_iters:
+                    raise RuntimeError(
+                        "SFT dataloader stuck while packing a row: "
+                        f"split={split}, row_len={len(row)}, row_capacity={row_capacity}, "
+                        f"conv_buffer_len={len(conv_buffer)}, consumed={consumed}, "
+                        f"cursor={cursor}, epoch={epoch}, it={it}"
+                    )
                 # Ensure buffer has conversations
                 while len(conv_buffer) < buffer_size:
                     refill_buffer()
@@ -317,6 +339,19 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
         # PyTorch cross_entropy(ignore_index=-1) returns NaN when every target is ignored.
         # Skip such batches instead of poisoning training.
         if not torch.any(targets != -1):
+            empty_supervision_skips += 1
+            if empty_supervision_skips <= 3 or empty_supervision_skips % 50 == 0:
+                print0(
+                    "[debug] skipped no-supervision batch "
+                    f"(count={empty_supervision_skips}, split={split}, it={it}, "
+                    f"consumed={consumed}, conv_buffer_len={len(conv_buffer)}, epoch={epoch})"
+                )
+            if empty_supervision_skips > 500:
+                raise RuntimeError(
+                    "SFT dataloader skipped too many no-supervision batches: "
+                    f"split={split}, count={empty_supervision_skips}, it={it}, "
+                    f"consumed={consumed}, conv_buffer_len={len(conv_buffer)}, epoch={epoch}"
+                )
             continue
 
         yield inputs, targets
