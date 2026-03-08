@@ -436,9 +436,9 @@ class GPT(nn.Module):
         assert len(list(self.parameters())) == len(grouped_params)
         assert len({id(p) for p in grouped_params}) == len(grouped_params)
 
-        # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
+        # Scale the LR for the AdamW parameters by 1/sqrt(dmodel) (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
-        print0(f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}")
+        print0(f"Scaling the LR for the AdamW parameters ~ 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
 
         # Build param_groups with all required fields explicit
         param_groups = [

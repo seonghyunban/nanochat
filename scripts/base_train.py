@@ -106,7 +106,7 @@ wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project=wandb_projec
 
 # Flash Attention status
 if HAS_FA3:
-    print0("✓ Using Flash Attention 3 (Hopper GPU detected), efficient, new and awesome.")
+    print0("Using Flash Attention 3 (Hopper GPU detected), efficient and available.")
 else:
     print0("!" * 80)
     print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback")
@@ -192,7 +192,7 @@ if args.fp8:
         convert_to_float8_training(model, config=fp8_config, module_filter_fn=fp8_module_filter)
         num_fp8 = sum(1 for m in model.modules() if 'Float8' in type(m).__name__)
         num_skipped = num_linear - num_fp8
-        print0(f"✓ FP8 training enabled ({args.fp8_recipe} scaling) - converted {num_fp8}/{num_linear} linear layers, skipped {num_skipped} (too small)")
+        print0(f"FP8 training enabled ({args.fp8_recipe} scaling) - converted {num_fp8}/{num_linear} linear layers, skipped {num_skipped} (too small)")
 
 # Context manager to temporarily disable FP8 so that model evaluation remains in BF16
 @contextmanager
