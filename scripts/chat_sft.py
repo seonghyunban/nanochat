@@ -46,6 +46,7 @@ parser.add_argument("--model-step", type=int, default=None, help="model step to 
 parser.add_argument("--load-optimizer", type=int, default=1, help="warm-start optimizer from pretrained checkpoint (0=no, 1=yes)")
 # Training horizon
 parser.add_argument("--num-iterations", type=int, default=-1, help="number of optimization steps (-1 = full epoch)")
+parser.add_argument("--disable-compile", type=int, default=0, help="disable torch.compile for debugging/smoke runs")
 # Batch sizes (default: inherit from pretrained checkpoint)
 parser.add_argument("--max-seq-len", type=int, default=None, help="max context length (default: inherit from pretrain)")
 parser.add_argument("--device-batch-size", type=int, default=None, help="per-device batch size (default: inherit from pretrain)")
@@ -125,7 +126,11 @@ for name, fallback, source in [
         print0(f"Using {name}={arg_val}")
 
 orig_model = model
-model = torch.compile(model, dynamic=False)
+if args.disable_compile:
+    print0("[debug] torch.compile disabled")
+else:
+    model = torch.compile(model, dynamic=False)
+    print0("[debug] torch.compile enabled")
 depth = model.config.n_layer
 num_flops_per_token = model.estimate_flops()
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
