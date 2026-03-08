@@ -51,6 +51,9 @@ parser.add_argument("--resume-from-step", type=int, default=None, help="resume t
 parser.add_argument("--num-iterations", type=int, default=-1, help="number of optimization steps (-1 = full epoch)")
 parser.add_argument("--disable-compile", type=int, default=0, help="disable torch.compile for debugging/smoke runs")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoint every N steps (-1 = final checkpoint only)")
+parser.add_argument("--debug-trace-every", type=int, default=0, help="emit detailed per-phase step tracing every N steps (0 = disabled)")
+parser.add_argument("--debug-trace-first-steps", type=int, default=0, help="emit detailed per-phase tracing for the first N optimization steps")
+parser.add_argument("--debug-trace-file", type=str, default="", help="optional path to append detailed step-phase trace lines")
 # Batch sizes (default: inherit from pretrained checkpoint)
 parser.add_argument("--max-seq-len", type=int, default=None, help="max context length (default: inherit from pretrain)")
 parser.add_argument("--device-batch-size", type=int, default=None, help="per-device batch size (default: inherit from pretrain)")
@@ -75,6 +78,23 @@ parser.add_argument("--gsm8k-epochs", type=int, default=4, help="number of epoch
 args = parser.parse_args()
 user_config = vars(args).copy()
 # -----------------------------------------------------------------------------
+
+debug_trace_path = args.debug_trace_file.strip()
+
+def debug_trace(message):
+    if not master_process:
+        return
+    print0(message)
+    if debug_trace_path:
+        with open(debug_trace_path, "a", encoding="utf-8") as f:
+            f.write(message + "\n")
+
+def should_trace_step(step):
+    if args.debug_trace_first_steps > 0 and step < args.debug_trace_first_steps:
+        return True
+    if args.debug_trace_every > 0 and step > 0 and step % args.debug_trace_every == 0:
+        return True
+    return False
 
 # Compute init
 print("[debug] starting compute_init")
@@ -525,25 +545,55 @@ while True:
     # evaluate the gradient
     if step == 0:
         print0("[debug] entering first training step")
+    trace_this_step = should_trace_step(step)
+    if trace_this_step:
+        debug_trace(
+            f"[trace] step={step} enter | last_step={last_step} | progress={progress:.6f} | "
+            f"approx_progress={approx_progress:.6f} | grad_accum_steps={grad_accum_steps} | "
+            f"x_shape={tuple(x.shape)} | y_shape={tuple(y.shape)} | x_dtype={x.dtype} | y_dtype={y.dtype}"
+        )
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
+        if trace_this_step:
+            debug_trace(
+                f"[trace] step={step} micro={micro_step}/{grad_accum_steps} pre-forward | "
+                f"x_shape={tuple(x.shape)} | y_shape={tuple(y.shape)} | "
+                f"x_device={x.device} | y_device={y.device}"
+            )
         if step == 0 and micro_step == 0:
             print0("[debug] first step: starting forward")
         with autocast_ctx:
             loss = model(x, y)
+        if trace_this_step:
+            debug_trace(
+                f"[trace] step={step} micro={micro_step}/{grad_accum_steps} post-forward | "
+                f"loss={float(loss.detach().item()):.6f}"
+            )
         if step == 0 and micro_step == 0:
             print0("[debug] first step: forward finished")
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         loss.backward()
+        if trace_this_step:
+            debug_trace(f"[trace] step={step} micro={micro_step}/{grad_accum_steps} post-backward")
         if step == 0 and micro_step == 0:
             print0("[debug] first step: backward finished")
         x, y = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+        if trace_this_step:
+            debug_trace(
+                f"[trace] step={step} micro={micro_step}/{grad_accum_steps} post-prefetch | "
+                f"next_x_shape={tuple(x.shape)} | next_y_shape={tuple(y.shape)}"
+            )
         if step == 0 and micro_step == 0:
             print0("[debug] first step: next batch prefetched")
         progress = max(progress, approx_progress) # only increase progress monotonically
     # step the optimizer
+    if trace_this_step:
+        debug_trace(
+            f"[trace] step={step} pre-optimizer | lrm={get_lr_multiplier(progress):.6f} | "
+            f"muon_momentum={get_muon_momentum(step):.6f}"
+        )
     if step == 0:
         print0("[debug] first step: starting optimizer step")
     lrm = get_lr_multiplier(progress)
@@ -553,10 +603,16 @@ while True:
         if group['kind'] == 'muon':
             group["momentum"] = muon_momentum
     optimizer.step()
+    if trace_this_step:
+        debug_trace(f"[trace] step={step} post-optimizer")
     if step == 0:
         print0("[debug] first step: optimizer step finished")
     model.zero_grad(set_to_none=True)
+    if trace_this_step:
+        debug_trace(f"[trace] step={step} post-zero-grad")
     synchronize()
+    if trace_this_step:
+        debug_trace(f"[trace] step={step} post-synchronize")
     if step == 0:
         print0("[debug] first step: synchronize finished")
     t1 = time.time()
