@@ -445,17 +445,29 @@ while True:
     # -------------------------------------------------------------------------
     # single training step
     # evaluate the gradient
+    if step == 0:
+        print0("[debug] entering first training step")
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
+        if step == 0 and micro_step == 0:
+            print0("[debug] first step: starting forward")
         with autocast_ctx:
             loss = model(x, y)
+        if step == 0 and micro_step == 0:
+            print0("[debug] first step: forward finished")
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         loss.backward()
+        if step == 0 and micro_step == 0:
+            print0("[debug] first step: backward finished")
         x, y = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+        if step == 0 and micro_step == 0:
+            print0("[debug] first step: next batch prefetched")
         progress = max(progress, approx_progress) # only increase progress monotonically
     # step the optimizer
+    if step == 0:
+        print0("[debug] first step: starting optimizer step")
     lrm = get_lr_multiplier(progress)
     muon_momentum = get_muon_momentum(step)
     for group in optimizer.param_groups:
@@ -463,8 +475,12 @@ while True:
         if group['kind'] == 'muon':
             group["momentum"] = muon_momentum
     optimizer.step()
+    if step == 0:
+        print0("[debug] first step: optimizer step finished")
     model.zero_grad(set_to_none=True)
     synchronize()
+    if step == 0:
+        print0("[debug] first step: synchronize finished")
     t1 = time.time()
     dt = t1 - t0
     # -------------------------------------------------------------------------
