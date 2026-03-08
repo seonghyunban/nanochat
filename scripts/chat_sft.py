@@ -302,6 +302,13 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
             if content_len < row_capacity:
                 targets[i, content_len-1:] = -1
 
+        # Some packed batches may end up with no supervised assistant tokens at all
+        # (e.g. a batch of user-only/prompt-only fragments after truncation/padding).
+        # PyTorch cross_entropy(ignore_index=-1) returns NaN when every target is ignored.
+        # Skip such batches instead of poisoning training.
+        if not torch.any(targets != -1):
+            continue
+
         yield inputs, targets
 
 train_loader = sft_data_generator_bos_bestfit("train")
