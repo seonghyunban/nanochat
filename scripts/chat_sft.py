@@ -47,6 +47,7 @@ parser.add_argument("--load-optimizer", type=int, default=1, help="warm-start op
 # Training horizon
 parser.add_argument("--num-iterations", type=int, default=-1, help="number of optimization steps (-1 = full epoch)")
 parser.add_argument("--disable-compile", type=int, default=0, help="disable torch.compile for debugging/smoke runs")
+parser.add_argument("--save-every", type=int, default=-1, help="save checkpoint every N steps (-1 = final checkpoint only)")
 # Batch sizes (default: inherit from pretrained checkpoint)
 parser.add_argument("--max-seq-len", type=int, default=None, help="max context length (default: inherit from pretrain)")
 parser.add_argument("--device-batch-size", type=int, default=None, help="per-device batch size (default: inherit from pretrain)")
@@ -380,6 +381,35 @@ def get_muon_momentum(it):
     momentum = (1 - frac) * 0.85 + frac * 0.95
     return momentum
 
+
+def save_sft_checkpoint(step, val_bpb):
+    output_dirname = args.model_tag if args.model_tag else f"d{depth}"  # e.g. d12
+    checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", output_dirname)
+    save_checkpoint(
+        checkpoint_dir,
+        step,
+        orig_model.state_dict(),
+        optimizer.state_dict(),
+        {
+            "step": step,
+            "val_bpb": val_bpb,
+            "model_config": {
+                "sequence_len": args.max_seq_len,
+                "vocab_size": tokenizer.get_vocab_size(),
+                "n_layer": depth,
+                "n_head": model.config.n_head,
+                "n_kv_head": model.config.n_kv_head,
+                "n_embd": model.config.n_embd,
+                "window_pattern": model.config.window_pattern,
+                "mlp_variant": model.config.mlp_variant,
+                "residual_variant": model.config.residual_variant,
+                "layerscale_init": model.config.layerscale_init,
+            },
+            "user_config": user_config,
+        },
+        rank=ddp_rank,
+    )
+
 # -----------------------------------------------------------------------------
 # Training loop
 print0("[debug] getting first batch")
@@ -455,32 +485,7 @@ while True:
 
     # save checkpoint at the end of the run (all ranks participate so each saves its optimizer shard)
     if last_step:
-        output_dirname = args.model_tag if args.model_tag else f"d{depth}" # e.g. d12
-        checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", output_dirname)
-        save_checkpoint(
-            checkpoint_dir,
-            step,
-            orig_model.state_dict(),
-            optimizer.state_dict(),
-            {
-                "step": step,
-                "val_bpb": val_bpb, # loss at last step
-                "model_config": {
-                    "sequence_len": args.max_seq_len,
-                    "vocab_size": tokenizer.get_vocab_size(),
-                    "n_layer": depth,
-                    "n_head": model.config.n_head,
-                    "n_kv_head": model.config.n_kv_head,
-                    "n_embd": model.config.n_embd,
-                    "window_pattern": model.config.window_pattern,
-                    "mlp_variant": model.config.mlp_variant,
-                    "residual_variant": model.config.residual_variant,
-                    "layerscale_init": model.config.layerscale_init,
-                },
-                "user_config": user_config, # inputs to the training script
-            },
-            rank=ddp_rank,
-        )
+        save_sft_checkpoint(step, val_bpb)
 
     if last_step:
         break
@@ -530,6 +535,11 @@ while True:
 
     # State
     step += 1
+
+    if args.save_every > 0 and step % args.save_every == 0:
+        with torch.no_grad():
+            save_sft_checkpoint(step, min_val_bpb if min_val_bpb != float("inf") else float("nan"))
+        print0(f"Step {step:05d} | Checkpoint saved")
 
     # logging
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss.item() # EMA the training loss
