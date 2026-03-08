@@ -317,13 +317,13 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
             if consumed >= dataset_size:
                 last_step = True
 
-        # Build tensors
-        use_cuda = device_type == "cuda"
-        batch_tensor = torch.tensor(rows, dtype=torch.long, pin_memory=use_cuda)
-        mask_tensor = torch.tensor(row_masks, dtype=torch.bool, pin_memory=use_cuda)
-        inputs = batch_tensor[:, :-1].to(device=device, dtype=torch.int32, non_blocking=use_cuda)
-        targets = batch_tensor[:, 1:].to(device=device, dtype=torch.int64, non_blocking=use_cuda)
-        target_mask = mask_tensor[:, 1:].to(device=device, non_blocking=use_cuda)
+        # Build tensors. Use synchronous CPU->GPU copies for stability on this branch.
+        # The async pinned-memory path has been causing intermittent native crashes.
+        batch_tensor = torch.tensor(rows, dtype=torch.long, pin_memory=False)
+        mask_tensor = torch.tensor(row_masks, dtype=torch.bool, pin_memory=False)
+        inputs = batch_tensor[:, :-1].to(device=device, dtype=torch.int32, non_blocking=False)
+        targets = batch_tensor[:, 1:].to(device=device, dtype=torch.int64, non_blocking=False)
+        target_mask = mask_tensor[:, 1:].to(device=device, non_blocking=False)
 
         # Only assistant-side tokens should contribute to the SFT loss.
         targets = targets.masked_fill(~target_mask, -1)
