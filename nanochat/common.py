@@ -98,10 +98,10 @@ def print0(s="",**kwargs):
     ddp_rank = int(os.environ.get('RANK', 0))
     if ddp_rank == 0:
         try:
-            print(s, **kwargs)
+            print(s, flush=True, **kwargs)
         except UnicodeEncodeError:
             safe = str(s).encode("ascii", errors="backslashreplace").decode("ascii")
-            print(safe, **kwargs)
+            print(safe, flush=True, **kwargs)
 
 def print_banner():
     # Cool DOS Rebel font ASCII banner made with https://manytools.org/hacker-tools/ascii-banner/
