@@ -27,7 +27,7 @@ from contextlib import nullcontext
 from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, DummyWandb, autodetect_device_type
 from nanochat.checkpoint_manager import save_checkpoint, load_model
 from nanochat.engine import Engine
-from tasks.gsm8k import GSM8K
+from tasks.gsm8k import GSM8K, load_reward_config
 
 # -----------------------------------------------------------------------------
 # CLI arguments
@@ -60,6 +60,8 @@ parser.add_argument("--init-lr-frac", type=float, default=0.05, help="initial LR
 parser.add_argument("--eval-every", type=int, default=60, help="evaluate pass@k every N steps")
 parser.add_argument("--eval-examples", type=int, default=400, help="number of examples for pass@k evaluation")
 parser.add_argument("--save-every", type=int, default=60, help="save checkpoint every N steps")
+# Reward configuration
+parser.add_argument("--reward-config", type=str, default=None, help="path to JSON reward config file (default: correctness only)")
 args = parser.parse_args()
 user_config = vars(args).copy()
 # -----------------------------------------------------------------------------
@@ -80,9 +82,13 @@ model, tokenizer, meta = load_model("sft", device, phase="eval", model_tag=args.
 engine = Engine(model, tokenizer) # for sampling rollouts
 
 # -----------------------------------------------------------------------------
+# Load reward configuration
+reward_names = load_reward_config(args.reward_config) if args.reward_config else ["correctness"]
+print0(f"Reward components: {reward_names}")
+
 # Rollout / sampling generator loop that yields batches of examples for training
 
-train_task = GSM8K(subset="main", split="train")
+train_task = GSM8K(subset="main", split="train", reward_names=reward_names)
 val_task = GSM8K(subset="main", split="test")
 num_steps = (len(train_task) // args.examples_per_step) * args.num_epochs
 print0(f"Calculated number of steps: {num_steps}")
@@ -122,14 +128,17 @@ def get_batch():
 
         # Calculate the rewards for each sample
         rewards = []
+        component_rewards = {name: [] for name in reward_names}
         for sample_tokens in generated_token_sequences:
             # Get just the generated tokens (after the prompt)
             generated_tokens = sample_tokens[prefix_length:]
             # Decode the generated response
             generated_text = tokenizer.decode(generated_tokens)
-            # Calculate the reward
-            reward = train_task.reward(conversation, generated_text)
-            rewards.append(reward)
+            # Calculate the reward (returns total + per-component breakdown)
+            total_reward, components = train_task.reward(conversation, generated_text)
+            rewards.append(total_reward)
+            for name in reward_names:
+                component_rewards[name].append(components[name])
 
         # Pad the sequences so that their lengths (in time) match
         max_length = max(len(seq) for seq in generated_token_sequences)
@@ -148,8 +157,10 @@ def get_batch():
         # Calculate the advantages by simply subtracting the mean (instead of z-score (x-mu)/sigma)
         mu = rewards.mean()
         advantages = rewards - mu
+        # Convert per-component rewards to tensors
+        component_reward_tensors = {name: torch.tensor(vals, dtype=torch.float, device=device) for name, vals in component_rewards.items()}
         # yield inputs/targets as (B, T) of ids and rewards as (B,) of floats
-        yield generated_token_sequences, inputs, targets, rewards, advantages
+        yield generated_token_sequences, inputs, targets, rewards, advantages, component_reward_tensors
 
 # -----------------------------------------------------------------------------
 # Simple evaluation loop for GSM8K pass@k
@@ -251,10 +262,11 @@ for step in range(num_steps):
 
     # Forward/Backward on rollouts over multiple examples in the dataset
     rewards_list = []
+    component_rewards_lists = {name: [] for name in reward_names}
     sequence_lengths = []
     for example_step in range(examples_per_rank):
         # Get one batch corresponding to one example in the training dataset
-        sequences_all, inputs_all, targets_all, rewards_all, advantages_all = next(batch_iterator)
+        sequences_all, inputs_all, targets_all, rewards_all, advantages_all, component_rewards_all = next(batch_iterator)
         # Evaluate the loss and gradients
         model.train() # ensure the model is in train mode
         # We need one more loop because we can never exceed the device_batch_size
@@ -282,11 +294,14 @@ for step in range(num_steps):
             print0(f"Step {step}/{num_steps} | Example step {example_step} | Pass {pass_idx} | loss: {loss.item():.6f} | Average reward: {rewards.mean().item()}")
         # For logging
         rewards_list.append(rewards_all.mean().item())
+        for name in reward_names:
+            component_rewards_lists[name].append(component_rewards_all[name].mean().item())
         sequence_lengths.extend(len(seq) for seq in sequences_all)
 
     # A bunch of logging for how the rollouts went this step
     mean_reward = sum(rewards_list) / len(rewards_list)
     mean_sequence_length = sum(sequence_lengths) / len(sequence_lengths)
+    mean_component_rewards = {name: sum(vals) / len(vals) for name, vals in component_rewards_lists.items()}
     if ddp: # aggregate across ranks
         mean_reward_tensor = torch.tensor(mean_reward, dtype=torch.float, device=device)
         mean_sequence_length_tensor = torch.tensor(mean_sequence_length, dtype=torch.float, device=device)
@@ -294,12 +309,20 @@ for step in range(num_steps):
         dist.all_reduce(mean_sequence_length_tensor, op=dist.ReduceOp.AVG)
         mean_reward = mean_reward_tensor.item()
         mean_sequence_length = mean_sequence_length_tensor.item()
-    print0(f"Step {step}/{num_steps} | Average reward: {mean_reward} | Average sequence length: {mean_sequence_length:.2f}")
-    wandb_run.log({
+        for name in reward_names:
+            t = torch.tensor(mean_component_rewards[name], dtype=torch.float, device=device)
+            dist.all_reduce(t, op=dist.ReduceOp.AVG)
+            mean_component_rewards[name] = t.item()
+    component_str = " | ".join(f"{name}: {mean_component_rewards[name]:.4f}" for name in reward_names)
+    print0(f"Step {step}/{num_steps} | Average reward: {mean_reward} | {component_str} | Average sequence length: {mean_sequence_length:.2f}")
+    log_dict = {
         "step": step,
         "reward": mean_reward,
         "sequence_length": mean_sequence_length,
-    })
+    }
+    for name in reward_names:
+        log_dict[f"reward/{name}"] = mean_component_rewards[name]
+    wandb_run.log(log_dict)
 
     # Update the model parameters
     lrm = get_lr_multiplier(step)

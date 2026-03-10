@@ -15,11 +15,13 @@ Notice that GSM8K uses tool calls inside << >> tags.
 """
 
 import re
+import json
 from datasets import load_dataset
 from tasks.common import Task
 
 
 GSM_RE = re.compile(r"#### (\-?[0-9\.\,]+)")
+
 def extract_answer(completion):
     """
     Extract the numerical answer after #### marker.
@@ -33,14 +35,81 @@ def extract_answer(completion):
         return match_str
     return None
 
+# ---------------------------------------------------------------------------
+# Reward function registry — each function: (conversation, response) -> float
+# ---------------------------------------------------------------------------
+
+def reward_correctness(conversation, assistant_response):
+    """Original binary correctness reward: 1.0 if exact match, 0.0 otherwise."""
+    assistant_message = conversation['messages'][-1]
+    last_text_part = assistant_message['content'][-1]['text']
+    ref_num = extract_answer(last_text_part)
+    pred_num = extract_answer(assistant_response)
+    return float(int(pred_num == ref_num))
+
+def reward_format_compliance(conversation, assistant_response):
+    """Reward A: 1.0 if response contains #### <number>, 0.0 otherwise."""
+    match = GSM_RE.search(assistant_response)
+    return 1.0 if match else 0.0
+
+def reward_numeric_proximity(conversation, assistant_response):
+    """Reward B: partial credit based on distance to gold answer."""
+    assistant_message = conversation['messages'][-1]
+    last_text_part = assistant_message['content'][-1]['text']
+    ref_match = GSM_RE.search(last_text_part)
+    if not ref_match:
+        return 0.0
+    ref_str = ref_match.group(1).strip().replace(",", "")
+    pred_match = GSM_RE.search(assistant_response)
+    if not pred_match:
+        return 0.0
+    pred_str = pred_match.group(1).strip().replace(",", "")
+    try:
+        ref_num = float(ref_str)
+        pred_num = float(pred_str)
+    except ValueError:
+        return 0.0
+    distance = abs(pred_num - ref_num)
+    denominator = abs(ref_num) + 1.0
+    return max(0.0, 1.0 - distance / denominator)
+
+# Stubs for post-P3 rewards
+def reward_c(conversation, assistant_response):
+    """Reward C: TBD — fill after P3 error analysis."""
+    raise NotImplementedError("Reward C not yet designed — requires P3 deliverable")
+
+def reward_d(conversation, assistant_response):
+    """Reward D: TBD — fill after P3 error analysis."""
+    raise NotImplementedError("Reward D not yet designed — requires P3 deliverable")
+
+REWARD_REGISTRY = {
+    "correctness": reward_correctness,
+    "format_compliance": reward_format_compliance,
+    "numeric_proximity": reward_numeric_proximity,
+    "reward_c": reward_c,
+    "reward_d": reward_d,
+}
+
+def load_reward_config(path):
+    """Load a JSON reward config file. Returns list of reward names to use."""
+    with open(path) as f:
+        config = json.load(f)
+    names = config.get("rewards", ["correctness"])
+    for name in names:
+        if name not in REWARD_REGISTRY:
+            raise ValueError(f"Unknown reward '{name}'. Available: {list(REWARD_REGISTRY.keys())}")
+    return names
+
 
 class GSM8K(Task):
 
-    def __init__(self, subset, split, **kwargs):
+    def __init__(self, subset, split, reward_names=None, **kwargs):
         super().__init__(**kwargs)
         assert subset in ["main", "socratic"], "GSM8K subset must be main|socratic"
         assert split in ["train", "test"], "GSM8K split must be train|test"
         self.ds = load_dataset("openai/gsm8k", subset, split=split).shuffle(seed=42)
+        # Reward dispatch: list of reward component names to sum
+        self.reward_names = reward_names or ["correctness"]
 
     @property
     def eval_type(self):
@@ -109,9 +178,11 @@ class GSM8K(Task):
 
     def reward(self, conversation, assistant_response):
         """
-        Used during RL. To keep things simple, just re-use the evaluation above.
-        Later this could be made more complex (e.g. format matching etc.)
+        Used during RL. Dispatches through self.reward_names and sums components.
+        Returns (total_reward, per_component_dict).
         """
-        is_correct = self.evaluate(conversation, assistant_response)
-        is_correct_float = float(is_correct)
-        return is_correct_float
+        components = {}
+        for name in self.reward_names:
+            components[name] = REWARD_REGISTRY[name](conversation, assistant_response)
+        total = sum(components.values())
+        return total, components
