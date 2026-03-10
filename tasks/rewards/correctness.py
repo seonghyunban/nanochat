@@ -8,4 +8,6 @@ def reward_correctness(conversation, assistant_response):
     last_text_part = assistant_message['content'][-1]['text']
     ref_num = extract_answer(last_text_part)
     pred_num = extract_answer(assistant_response)
+    if ref_num is None or pred_num is None:
+        return 0.0
     return float(int(pred_num == ref_num))

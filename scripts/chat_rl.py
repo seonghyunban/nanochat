@@ -27,7 +27,7 @@ from contextlib import nullcontext
 from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, DummyWandb, autodetect_device_type
 from nanochat.checkpoint_manager import save_checkpoint, load_model
 from nanochat.engine import Engine
-from tasks.gsm8k import GSM8K, load_reward_config
+from tasks.gsm8k import GSM8K
 
 # -----------------------------------------------------------------------------
 # CLI arguments
@@ -61,7 +61,7 @@ parser.add_argument("--eval-every", type=int, default=60, help="evaluate pass@k 
 parser.add_argument("--eval-examples", type=int, default=400, help="number of examples for pass@k evaluation")
 parser.add_argument("--save-every", type=int, default=60, help="save checkpoint every N steps")
 # Reward configuration
-parser.add_argument("--reward-config", type=str, default=None, help="path to JSON reward config file (default: correctness only)")
+parser.add_argument("--rewards", type=str, nargs="+", default=["correctness"], help="reward component names to use (default: correctness)")
 args = parser.parse_args()
 user_config = vars(args).copy()
 # -----------------------------------------------------------------------------
@@ -82,8 +82,12 @@ model, tokenizer, meta = load_model("sft", device, phase="eval", model_tag=args.
 engine = Engine(model, tokenizer) # for sampling rollouts
 
 # -----------------------------------------------------------------------------
-# Load reward configuration
-reward_names = load_reward_config(args.reward_config) if args.reward_config else ["correctness"]
+# Validate reward names
+from tasks.rewards import REWARD_REGISTRY
+for name in args.rewards:
+    if name not in REWARD_REGISTRY:
+        raise ValueError(f"Unknown reward '{name}'. Available: {list(REWARD_REGISTRY.keys())}")
+reward_names = args.rewards
 print0(f"Reward components: {reward_names}")
 
 # Rollout / sampling generator loop that yields batches of examples for training

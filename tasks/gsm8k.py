@@ -15,26 +15,10 @@ Notice that GSM8K uses tool calls inside << >> tags.
 """
 
 import re
-import json
 from datasets import load_dataset
 from tasks.common import Task
 from tasks.rewards.gsm8k_utils import GSM_RE, extract_answer
-
-# ---------------------------------------------------------------------------
-# Reward dispatch — functions live in tasks/rewards/, registry in __init__.py
-# ---------------------------------------------------------------------------
-
 from tasks.rewards import REWARD_REGISTRY
-
-def load_reward_config(path):
-    """Load a JSON reward config file. Returns list of reward names to use."""
-    with open(path) as f:
-        config = json.load(f)
-    names = config.get("rewards", ["correctness"])
-    for name in names:
-        if name not in REWARD_REGISTRY:
-            raise ValueError(f"Unknown reward '{name}'. Available: {list(REWARD_REGISTRY.keys())}")
-    return names
 
 
 class GSM8K(Task):
