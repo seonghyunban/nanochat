@@ -18,77 +18,13 @@ import re
 import json
 from datasets import load_dataset
 from tasks.common import Task
-
-
-GSM_RE = re.compile(r"#### (\-?[0-9\.\,]+)")
-
-def extract_answer(completion):
-    """
-    Extract the numerical answer after #### marker.
-    Follows official code for normalization:
-    https://github.com/openai/grade-school-math/blob/3101c7d5072418e28b9008a6636bde82a006892c/grade_school_math/dataset.py#L28
-    """
-    match = GSM_RE.search(completion)
-    if match:
-        match_str = match.group(1).strip()
-        match_str = match_str.replace(",", "")
-        return match_str
-    return None
+from tasks.rewards.gsm8k_utils import GSM_RE, extract_answer
 
 # ---------------------------------------------------------------------------
-# Reward function registry — each function: (conversation, response) -> float
+# Reward dispatch — functions live in tasks/rewards/, registry in __init__.py
 # ---------------------------------------------------------------------------
 
-def reward_correctness(conversation, assistant_response):
-    """Original binary correctness reward: 1.0 if exact match, 0.0 otherwise."""
-    assistant_message = conversation['messages'][-1]
-    last_text_part = assistant_message['content'][-1]['text']
-    ref_num = extract_answer(last_text_part)
-    pred_num = extract_answer(assistant_response)
-    return float(int(pred_num == ref_num))
-
-def reward_format_compliance(conversation, assistant_response):
-    """Reward A: 1.0 if response contains #### <number>, 0.0 otherwise."""
-    match = GSM_RE.search(assistant_response)
-    return 1.0 if match else 0.0
-
-def reward_numeric_proximity(conversation, assistant_response):
-    """Reward B: partial credit based on distance to gold answer."""
-    assistant_message = conversation['messages'][-1]
-    last_text_part = assistant_message['content'][-1]['text']
-    ref_match = GSM_RE.search(last_text_part)
-    if not ref_match:
-        return 0.0
-    ref_str = ref_match.group(1).strip().replace(",", "")
-    pred_match = GSM_RE.search(assistant_response)
-    if not pred_match:
-        return 0.0
-    pred_str = pred_match.group(1).strip().replace(",", "")
-    try:
-        ref_num = float(ref_str)
-        pred_num = float(pred_str)
-    except ValueError:
-        return 0.0
-    distance = abs(pred_num - ref_num)
-    denominator = abs(ref_num) + 1.0
-    return max(0.0, 1.0 - distance / denominator)
-
-# Stubs for post-P3 rewards
-def reward_c(conversation, assistant_response):
-    """Reward C: TBD — fill after P3 error analysis."""
-    raise NotImplementedError("Reward C not yet designed — requires P3 deliverable")
-
-def reward_d(conversation, assistant_response):
-    """Reward D: TBD — fill after P3 error analysis."""
-    raise NotImplementedError("Reward D not yet designed — requires P3 deliverable")
-
-REWARD_REGISTRY = {
-    "correctness": reward_correctness,
-    "format_compliance": reward_format_compliance,
-    "numeric_proximity": reward_numeric_proximity,
-    "reward_c": reward_c,
-    "reward_d": reward_d,
-}
+from tasks.rewards import REWARD_REGISTRY
 
 def load_reward_config(path):
     """Load a JSON reward config file. Returns list of reward names to use."""
