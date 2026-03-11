@@ -323,7 +323,6 @@ for step in range(num_steps):
             # Finally, formulate the loss that we want to minimize (instead of objective we wish to maximize)
             loss = -pg_obj
             loss.backward()
-            print0(f"Step {step}/{num_steps} | Example step {example_step} | Pass {pass_idx} | loss: {loss.item():.6f} | Average reward: {rewards.mean().item()}")
         # For logging
         rewards_list.append(rewards_all.mean().item())
         for name in reward_names:
@@ -354,7 +353,7 @@ for step in range(num_steps):
     _step_dur = _elapsed / _steps_done
     _step_ema = _step_dur if _step_ema is None else (1 - _EMA_ALPHA) * _step_ema + _EMA_ALPHA * _step_dur
     _eta_sec = _step_ema * (num_steps - _steps_done)
-    print0(f"Step {step}/{num_steps} ({_pct:.1f}%) | reward: {mean_reward:.4f} | {component_str} | seq_len: {mean_sequence_length:.1f} | {_fmt_time(_elapsed)} elapsed | ~{_fmt_time(_eta_sec)} remaining")
+    print0(f"Step {step+1}/{num_steps} ({_pct:.1f}%) | reward: {mean_reward:.4f} | {component_str} | seq_len: {mean_sequence_length:.1f} | {_fmt_time(_elapsed)} elapsed | ~{_fmt_time(_eta_sec)} remaining")
     log_dict = {
         "step": step,
         "reward": mean_reward,
