@@ -44,8 +44,16 @@ parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (e
 parser.add_argument("--model-tag", type=str, default=None, help="model tag to load from")
 parser.add_argument("--model-step", type=int, default=None, help="model step to load from")
 parser.add_argument("--load-optimizer", type=int, default=1, help="warm-start optimizer from pretrained checkpoint (0=no, 1=yes)")
+parser.add_argument("--resume-from-source", type=str, default="", help="resume source checkpoint family: base|sft|rl")
+parser.add_argument("--resume-from-tag", type=str, default="", help="resume training from an existing checkpoint tag")
+parser.add_argument("--resume-from-step", type=int, default=None, help="resume training from an existing checkpoint step")
 # Training horizon
 parser.add_argument("--num-iterations", type=int, default=-1, help="number of optimization steps (-1 = full epoch)")
+parser.add_argument("--disable-compile", type=int, default=0, help="disable torch.compile for debugging/smoke runs")
+parser.add_argument("--save-every", type=int, default=-1, help="save checkpoint every N steps (-1 = final checkpoint only)")
+parser.add_argument("--debug-trace-every", type=int, default=0, help="emit detailed per-phase step tracing every N steps (0 = disabled)")
+parser.add_argument("--debug-trace-first-steps", type=int, default=0, help="emit detailed per-phase tracing for the first N optimization steps")
+parser.add_argument("--debug-trace-file", type=str, default="", help="optional path to append detailed step-phase trace lines")
 # Batch sizes (default: inherit from pretrained checkpoint)
 parser.add_argument("--max-seq-len", type=int, default=None, help="max context length (default: inherit from pretrain)")
 parser.add_argument("--device-batch-size", type=int, default=None, help="per-device batch size (default: inherit from pretrain)")
@@ -71,9 +79,28 @@ args = parser.parse_args()
 user_config = vars(args).copy()
 # -----------------------------------------------------------------------------
 
+debug_trace_path = args.debug_trace_file.strip()
+
+def debug_trace(message):
+    if not master_process:
+        return
+    print0(message)
+    if debug_trace_path:
+        with open(debug_trace_path, "a", encoding="utf-8") as f:
+            f.write(message + "\n")
+
+def should_trace_step(step):
+    if args.debug_trace_first_steps > 0 and step < args.debug_trace_first_steps:
+        return True
+    if args.debug_trace_every > 0 and step > 0 and step % args.debug_trace_every == 0:
+        return True
+    return False
+
 # Compute init
+print("[debug] starting compute_init")
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
+print("[debug] compute_init finished")
 master_process = ddp_rank == 0
 autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == "cuda" else nullcontext()
 synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
@@ -87,14 +114,45 @@ else:
 
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
-wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-sft", name=args.run, config=user_config)
+wandb_project = os.environ.get("WANDB_PROJECT", "490-autobook-a4")
+wandb_run = (
+    DummyWandb()
+    if use_dummy_wandb
+    else wandb.init(project=wandb_project, name=args.run, config=user_config)
+)
 
 # Flash Attention status
 if not HAS_FA3:
     print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback. Training will be less efficient.")
 
+resume_enabled = bool(args.resume_from_tag)
+if resume_enabled and args.resume_from_step is None:
+    raise ValueError("--resume-from-step is required when --resume-from-tag is provided")
+if args.resume_from_step is not None and not resume_enabled:
+    raise ValueError("--resume-from-tag is required when --resume-from-step is provided")
+if args.resume_from_source and not resume_enabled:
+    raise ValueError("--resume-from-tag is required when --resume-from-source is provided")
+resume_source = args.resume_from_source or "sft"
+if resume_source not in {"base", "sft", "rl"}:
+    raise ValueError(f"Invalid --resume-from-source={resume_source!r}; expected base|sft|rl")
+
+load_source = resume_source if resume_enabled else "base"
+load_tag = args.resume_from_tag if resume_enabled else args.model_tag
+load_step = args.resume_from_step if resume_enabled else args.model_step
+resume_step = load_step if resume_enabled else 0
+if args.num_iterations > 0 and resume_step >= args.num_iterations:
+    raise ValueError(
+        f"Resume step {resume_step} is already >= requested num_iterations {args.num_iterations}"
+    )
+
+if resume_enabled:
+    print0(
+        f"Resuming SFT from {load_source}:{load_tag}@{load_step} "
+        f"-> output tag {args.model_tag or load_tag}"
+    )
+
 # Load the model and tokenizer
-model, tokenizer, meta = load_model("base", device, phase="train", model_tag=args.model_tag, step=args.model_step)
+model, tokenizer, meta = load_model(load_source, device, phase="train", model_tag=load_tag, step=load_step)
 
 # Inherit training hyperparameters from pretrained checkpoint (None = inherit, explicit value = override)
 pretrain_user_config = meta.get("user_config", {})
@@ -118,7 +176,11 @@ for name, fallback, source in [
         print0(f"Using {name}={arg_val}")
 
 orig_model = model
-model = torch.compile(model, dynamic=False)
+if args.disable_compile:
+    print0("[debug] torch.compile disabled")
+else:
+    model = torch.compile(model, dynamic=False)
+    print0("[debug] torch.compile enabled")
 depth = model.config.n_layer
 num_flops_per_token = model.estimate_flops()
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
@@ -140,16 +202,16 @@ optimizer = model.setup_optimizer(unembedding_lr=args.unembedding_lr, embedding_
 # restore our fresh SFT LRs after loading.
 base_dir = get_base_dir()
 if args.load_optimizer:
-    optimizer_data = load_optimizer_state("base", device, rank=ddp_rank, model_tag=args.model_tag, step=args.model_step)
+    optimizer_data = load_optimizer_state(load_source, device, rank=ddp_rank, model_tag=load_tag, step=load_step)
     if optimizer_data is not None:
         base_lrs = [group["lr"] for group in optimizer.param_groups]
         optimizer.load_state_dict(optimizer_data)
         del optimizer_data
         for group, base_lr in zip(optimizer.param_groups, base_lrs):
             group["lr"] = base_lr
-        print0("Loaded optimizer state from pretrained checkpoint (momentum buffers only, LRs reset)")
+        print0(f"Loaded optimizer state from {load_source} checkpoint (momentum buffers only, LRs reset)")
     else:
-        print0("WARNING: optimizer checkpoint not found, starting with fresh optimizer (slightly worse)")
+        print0(f"WARNING: optimizer checkpoint not found in {load_source}, starting with fresh optimizer")
 
 # Override the initial learning rate as a fraction of the base learning rate
 for group in optimizer.param_groups:
@@ -157,6 +219,7 @@ for group in optimizer.param_groups:
     group["initial_lr"] = group["lr"]
 
 # SFT data mixture and DataLoader
+print0("[debug] building SFT train task list")
 identity_conversations_filepath = os.path.join(base_dir, "identity_conversations.jsonl")
 train_tasks = [
     SmolTalk(split="train"), # 460K rows of general conversations
@@ -167,8 +230,10 @@ train_tasks = [
     SimpleSpelling(size=200000, split="train"), # 200K rows of Simple Spelling (e.g. spell the word 'apple')
     SpellingBee(size=80000, split="train"), # 80K rows of Spelling Bee (e.g. how many 'r' are in 'strawberry'?)
 ]
+print0("[debug] constructing train TaskMixture")
 train_dataset = TaskMixture(train_tasks)
 print0(f"Training mixture: {len(train_dataset):,} rows (MMLU x{args.mmlu_epochs}, GSM8K x{args.gsm8k_epochs})")
+print0("[debug] constructing val TaskMixture")
 val_dataset = TaskMixture([
     SmolTalk(split="test"), # 24K rows in test set
     MMLU(subset="all", split="test", stop=5200), # 14K rows in test set, use only 5.2K to match the train ratios
@@ -197,19 +262,33 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
     row_capacity = args.max_seq_len + 1  # +1 for target at last position
     bos_token = tokenizer.get_bos_token_id()
 
-    # Conversation buffer: list of token lists
+    # Conversation buffer: list of (token_ids, supervision_mask) pairs
     conv_buffer = []
     cursor = ddp_rank  # Each rank processes different conversations (for fetching)
     consumed = ddp_rank  # Track actual consumption separately from buffering
     epoch = 1
     it = 0  # iteration counter
+    empty_supervision_skips = 0
+    max_refill_iters = max(buffer_size * 10, 1000)
+    max_row_iters = max(row_capacity * 4, 2048)
 
     def refill_buffer():
         nonlocal cursor, epoch
+        refill_iters = 0
+        start_len = len(conv_buffer)
         while len(conv_buffer) < buffer_size:
+            refill_iters += 1
+            if refill_iters > max_refill_iters:
+                raise RuntimeError(
+                    "SFT dataloader stuck while refilling conversation buffer: "
+                    f"split={split}, start_len={start_len}, current_len={len(conv_buffer)}, "
+                    f"buffer_size={buffer_size}, cursor={cursor}, dataset_size={dataset_size}, "
+                    f"epoch={epoch}, it={it}"
+                )
             conversation = dataset[cursor]
-            ids, _ = tokenizer.render_conversation(conversation)
-            conv_buffer.append(ids)
+            ids, mask = tokenizer.render_conversation(conversation, max_tokens=row_capacity)
+            assert len(ids) == len(mask), "Token ids and supervision mask must be same length"
+            conv_buffer.append((ids, mask))
             cursor += ddp_world_size
             if cursor >= dataset_size:
                 cursor = cursor % dataset_size
@@ -218,11 +297,22 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
 
     while True:
         rows = []
+        row_masks = []
         row_lengths = []  # Track actual content length (excluding padding) for each row
         for _ in range(args.device_batch_size):
             row = []
+            row_mask = []
             padded = False
+            row_iters = 0
             while len(row) < row_capacity:
+                row_iters += 1
+                if row_iters > max_row_iters:
+                    raise RuntimeError(
+                        "SFT dataloader stuck while packing a row: "
+                        f"split={split}, row_len={len(row)}, row_capacity={row_capacity}, "
+                        f"conv_buffer_len={len(conv_buffer)}, consumed={consumed}, "
+                        f"cursor={cursor}, epoch={epoch}, it={it}"
+                    )
                 # Ensure buffer has conversations
                 while len(conv_buffer) < buffer_size:
                     refill_buffer()
@@ -232,22 +322,24 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
                 # Find largest conversation that fits entirely
                 best_idx = -1
                 best_len = 0
-                for i, conv in enumerate(conv_buffer):
-                    conv_len = len(conv)
+                for i, (conv_ids, _conv_mask) in enumerate(conv_buffer):
+                    conv_len = len(conv_ids)
                     if conv_len <= remaining and conv_len > best_len:
                         best_idx = i
                         best_len = conv_len
 
                 if best_idx >= 0:
                     # Found a conversation that fits - use it entirely
-                    conv = conv_buffer.pop(best_idx)
-                    row.extend(conv)
+                    conv_ids, conv_mask = conv_buffer.pop(best_idx)
+                    row.extend(conv_ids)
+                    row_mask.extend(conv_mask)
                     consumed += ddp_world_size  # Track actual consumption
                 else:
                     # No conversation fits - pad the remainder instead of cropping
                     # This ensures we never discard any tokens
                     content_len = len(row)
                     row.extend([bos_token] * remaining)  # Pad with BOS tokens
+                    row_mask.extend([0] * remaining)
                     padded = True
                     break  # Row is now full (with padding)
 
@@ -257,28 +349,35 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
             else:
                 row_lengths.append(row_capacity)
             rows.append(row[:row_capacity])
+            row_masks.append(row_mask[:row_capacity])
 
         # Stopping condition to respect num_iterations, if given
         it += 1
-        if 0 < args.num_iterations <= it and split == "train":
+        global_step = resume_step + it
+        if 0 < args.num_iterations <= global_step and split == "train":
             last_step = True
 
         # Update progress tracking (based on consumed, not cursor, to account for buffering)
         if split == "train":
             current_epoch = epoch
             if args.num_iterations > 0:
-                approx_progress = it / args.num_iterations
+                approx_progress = global_step / args.num_iterations
             else:
                 approx_progress = consumed / dataset_size
             # Trigger last_step when we've consumed enough (instead of when cursor wraps)
             if consumed >= dataset_size:
                 last_step = True
 
-        # Build tensors
-        use_cuda = device_type == "cuda"
-        batch_tensor = torch.tensor(rows, dtype=torch.long, pin_memory=use_cuda)
-        inputs = batch_tensor[:, :-1].to(device=device, dtype=torch.int32, non_blocking=use_cuda)
-        targets = batch_tensor[:, 1:].to(device=device, dtype=torch.int64, non_blocking=use_cuda)
+        # Build tensors. Use synchronous CPU->GPU copies for stability on this branch.
+        # The async pinned-memory path has been causing intermittent native crashes.
+        batch_tensor = torch.tensor(rows, dtype=torch.long, pin_memory=False)
+        mask_tensor = torch.tensor(row_masks, dtype=torch.bool, pin_memory=False)
+        inputs = batch_tensor[:, :-1].to(device=device, dtype=torch.int32, non_blocking=False)
+        targets = batch_tensor[:, 1:].to(device=device, dtype=torch.int64, non_blocking=False)
+        target_mask = mask_tensor[:, 1:].to(device=device, non_blocking=False)
+
+        # Only assistant-side tokens should contribute to the SFT loss.
+        targets = targets.masked_fill(~target_mask, -1)
 
         # Mask out padding positions in targets (set to -1 = ignore_index)
         # For each row, positions >= (content_length - 1) in targets should be masked
@@ -286,9 +385,31 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
             if content_len < row_capacity:
                 targets[i, content_len-1:] = -1
 
+        # Some packed batches may end up with no supervised assistant tokens at all
+        # (e.g. a batch of user-only/prompt-only fragments after truncation/padding).
+        # PyTorch cross_entropy(ignore_index=-1) returns NaN when every target is ignored.
+        # Skip such batches instead of poisoning training.
+        if not torch.any(targets != -1):
+            empty_supervision_skips += 1
+            if empty_supervision_skips <= 3 or empty_supervision_skips % 50 == 0:
+                print0(
+                    "[debug] skipped no-supervision batch "
+                    f"(count={empty_supervision_skips}, split={split}, it={it}, "
+                    f"consumed={consumed}, conv_buffer_len={len(conv_buffer)}, epoch={epoch})"
+                )
+            if empty_supervision_skips > 500:
+                raise RuntimeError(
+                    "SFT dataloader skipped too many no-supervision batches: "
+                    f"split={split}, count={empty_supervision_skips}, it={it}, "
+                    f"consumed={consumed}, conv_buffer_len={len(conv_buffer)}, epoch={epoch}"
+                )
+            continue
+
         yield inputs, targets
 
+print0("[debug] creating train_loader")
 train_loader = sft_data_generator_bos_bestfit("train")
+print0("[debug] train_loader created")
 build_val_loader = lambda: sft_data_generator_bos_bestfit("val")
 progress = 0 # will go from 0 to 1 over the course of the epoch
 
@@ -310,14 +431,45 @@ def get_muon_momentum(it):
     momentum = (1 - frac) * 0.85 + frac * 0.95
     return momentum
 
+
+def save_sft_checkpoint(step, val_bpb):
+    output_dirname = args.model_tag if args.model_tag else f"d{depth}"  # e.g. d12
+    checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", output_dirname)
+    save_checkpoint(
+        checkpoint_dir,
+        step,
+        orig_model.state_dict(),
+        optimizer.state_dict(),
+        {
+            "step": step,
+            "val_bpb": val_bpb,
+            "model_config": {
+                "sequence_len": args.max_seq_len,
+                "vocab_size": tokenizer.get_vocab_size(),
+                "n_layer": depth,
+                "n_head": model.config.n_head,
+                "n_kv_head": model.config.n_kv_head,
+                "n_embd": model.config.n_embd,
+                "window_pattern": model.config.window_pattern,
+                "mlp_variant": model.config.mlp_variant,
+                "residual_variant": model.config.residual_variant,
+                "layerscale_init": model.config.layerscale_init,
+            },
+            "user_config": user_config,
+        },
+        rank=ddp_rank,
+    )
+
 # -----------------------------------------------------------------------------
 # Training loop
+print0("[debug] getting first batch")
 x, y = next(train_loader) # prefetch the very first batch of data
+print0("[debug] first batch ready")
 min_val_bpb = float("inf")
 smooth_train_loss = 0 # EMA of training loss
 ema_beta = 0.9 # EMA decay factor
 total_training_time = 0 # total wall-clock time of training
-step = 0
+step = resume_step
 while True:
     flops_so_far = num_flops_per_token * args.total_batch_size * step
 
@@ -383,29 +535,7 @@ while True:
 
     # save checkpoint at the end of the run (all ranks participate so each saves its optimizer shard)
     if last_step:
-        output_dirname = args.model_tag if args.model_tag else f"d{depth}" # e.g. d12
-        checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", output_dirname)
-        save_checkpoint(
-            checkpoint_dir,
-            step,
-            orig_model.state_dict(),
-            optimizer.state_dict(),
-            {
-                "step": step,
-                "val_bpb": val_bpb, # loss at last step
-                "model_config": {
-                    "sequence_len": args.max_seq_len,
-                    "vocab_size": tokenizer.get_vocab_size(),
-                    "n_layer": depth,
-                    "n_head": model.config.n_head,
-                    "n_kv_head": model.config.n_kv_head,
-                    "n_embd": model.config.n_embd,
-                    "window_pattern": model.config.window_pattern,
-                },
-                "user_config": user_config, # inputs to the training script
-            },
-            rank=ddp_rank,
-        )
+        save_sft_checkpoint(step, val_bpb)
 
     if last_step:
         break
@@ -413,17 +543,59 @@ while True:
     # -------------------------------------------------------------------------
     # single training step
     # evaluate the gradient
+    if step == 0:
+        print0("[debug] entering first training step")
+    trace_this_step = should_trace_step(step)
+    if trace_this_step:
+        debug_trace(
+            f"[trace] step={step} enter | last_step={last_step} | progress={progress:.6f} | "
+            f"approx_progress={approx_progress:.6f} | grad_accum_steps={grad_accum_steps} | "
+            f"x_shape={tuple(x.shape)} | y_shape={tuple(y.shape)} | x_dtype={x.dtype} | y_dtype={y.dtype}"
+        )
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
+        if trace_this_step:
+            debug_trace(
+                f"[trace] step={step} micro={micro_step}/{grad_accum_steps} pre-forward | "
+                f"x_shape={tuple(x.shape)} | y_shape={tuple(y.shape)} | "
+                f"x_device={x.device} | y_device={y.device}"
+            )
+        if step == 0 and micro_step == 0:
+            print0("[debug] first step: starting forward")
         with autocast_ctx:
             loss = model(x, y)
+        if trace_this_step:
+            debug_trace(
+                f"[trace] step={step} micro={micro_step}/{grad_accum_steps} post-forward | "
+                f"loss={float(loss.detach().item()):.6f}"
+            )
+        if step == 0 and micro_step == 0:
+            print0("[debug] first step: forward finished")
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         loss.backward()
+        if trace_this_step:
+            debug_trace(f"[trace] step={step} micro={micro_step}/{grad_accum_steps} post-backward")
+        if step == 0 and micro_step == 0:
+            print0("[debug] first step: backward finished")
         x, y = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+        if trace_this_step:
+            debug_trace(
+                f"[trace] step={step} micro={micro_step}/{grad_accum_steps} post-prefetch | "
+                f"next_x_shape={tuple(x.shape)} | next_y_shape={tuple(y.shape)}"
+            )
+        if step == 0 and micro_step == 0:
+            print0("[debug] first step: next batch prefetched")
         progress = max(progress, approx_progress) # only increase progress monotonically
     # step the optimizer
+    if trace_this_step:
+        debug_trace(
+            f"[trace] step={step} pre-optimizer | lrm={get_lr_multiplier(progress):.6f} | "
+            f"muon_momentum={get_muon_momentum(step):.6f}"
+        )
+    if step == 0:
+        print0("[debug] first step: starting optimizer step")
     lrm = get_lr_multiplier(progress)
     muon_momentum = get_muon_momentum(step)
     for group in optimizer.param_groups:
@@ -431,14 +603,29 @@ while True:
         if group['kind'] == 'muon':
             group["momentum"] = muon_momentum
     optimizer.step()
+    if trace_this_step:
+        debug_trace(f"[trace] step={step} post-optimizer")
+    if step == 0:
+        print0("[debug] first step: optimizer step finished")
     model.zero_grad(set_to_none=True)
+    if trace_this_step:
+        debug_trace(f"[trace] step={step} post-zero-grad")
     synchronize()
+    if trace_this_step:
+        debug_trace(f"[trace] step={step} post-synchronize")
+    if step == 0:
+        print0("[debug] first step: synchronize finished")
     t1 = time.time()
     dt = t1 - t0
     # -------------------------------------------------------------------------
 
     # State
     step += 1
+
+    if args.save_every > 0 and step % args.save_every == 0:
+        with torch.no_grad():
+            save_sft_checkpoint(step, min_val_bpb if min_val_bpb != float("inf") else float("nan"))
+        print0(f"Step {step:05d} | Checkpoint saved")
 
     # logging
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss.item() # EMA the training loss

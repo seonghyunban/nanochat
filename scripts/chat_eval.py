@@ -37,6 +37,7 @@ def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_
 
     # Run the evaluation
     num_passed, total = 0, 0
+    log_every = 10
     for i in range(ddp_rank, num_problems, ddp_world_size):
         conversation = task_object[i]
 
@@ -63,6 +64,13 @@ def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_
 
         # Logging (overwrite the same line in the console)
         print(f"\r\033[KRank {ddp_rank} | {num_passed}/{total} ({100*num_passed/total:.2f}%)", end='', flush=True)
+        # Also emit periodic newline logs so remote log collectors (e.g. Modal) show progress.
+        if total == 1 or total % log_every == 0 or total == num_problems:
+            print()
+            print0(
+                f"[chat_eval] Rank {ddp_rank} progress: {total}/{num_problems} "
+                f"({100*total/num_problems:.2f}%) | local_acc={100*num_passed/total:.2f}%"
+            )
 
     # Finish the in-place progress line with a newline before final summary
     print()

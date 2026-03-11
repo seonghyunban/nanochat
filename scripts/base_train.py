@@ -51,6 +51,9 @@ parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = de
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+parser.add_argument("--mlp-variant", type=str, default="relu2", choices=["relu2", "swiglu"], help="MLP variant to use in each Transformer block")
+parser.add_argument("--residual-variant", type=str, default="standard", choices=["standard", "layerscale"], help="residual branch variant to use in each Transformer block")
+parser.add_argument("--layerscale-init", type=float, default=1e-4, help="initial value for LayerScale residual branch scalars")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -104,7 +107,7 @@ wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project=wandb_projec
 
 # Flash Attention status
 if HAS_FA3:
-    print0("✓ Using Flash Attention 3 (Hopper GPU detected), efficient, new and awesome.")
+    print0("Using Flash Attention 3 (Hopper GPU detected), efficient and available.")
 else:
     print0("!" * 80)
     print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback")
@@ -135,6 +138,9 @@ def build_model_meta(depth):
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
+        mlp_variant=args.mlp_variant,
+        residual_variant=args.residual_variant,
+        layerscale_init=args.layerscale_init,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -187,7 +193,7 @@ if args.fp8:
         convert_to_float8_training(model, config=fp8_config, module_filter_fn=fp8_module_filter)
         num_fp8 = sum(1 for m in model.modules() if 'Float8' in type(m).__name__)
         num_skipped = num_linear - num_fp8
-        print0(f"✓ FP8 training enabled ({args.fp8_recipe} scaling) - converted {num_fp8}/{num_linear} linear layers, skipped {num_skipped} (too small)")
+        print0(f"FP8 training enabled ({args.fp8_recipe} scaling) - converted {num_fp8}/{num_linear} linear layers, skipped {num_skipped} (too small)")
 
 # Context manager to temporarily disable FP8 so that model evaluation remains in BF16
 @contextmanager

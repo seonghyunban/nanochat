@@ -106,7 +106,58 @@ def place_eval_bundle(file_path):
     print0(f"Placed eval_bundle directory at {eval_bundle_dir}")
 
 
-def evaluate_core(model, tokenizer, device, max_per_task=-1):
+def _core_progress_path(base_dir: str, model_slug: str, max_per_task: int) -> str:
+    """Return progress file path for resumable CORE eval."""
+    max_task_suffix = "all" if max_per_task < 0 else str(max_per_task)
+    return os.path.join(base_dir, "base_eval_progress", f"{model_slug}_mpt{max_task_suffix}.json")
+
+
+def _load_core_progress(progress_path: str, expected_labels: list[str]) -> tuple[dict, dict]:
+    """Load previously completed CORE task results if present."""
+    if not os.path.exists(progress_path):
+        return {}, {}
+    try:
+        with open(progress_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        print0(f"[core] WARNING: failed to load progress file {progress_path}: {e}")
+        return {}, {}
+
+    allowed = set(expected_labels)
+    results = data.get("results", {})
+    centered = data.get("centered_results", {})
+    # Filter to expected labels only, in case benchmark definition changed.
+    results = {k: float(v) for k, v in results.items() if k in allowed}
+    centered = {k: float(v) for k, v in centered.items() if k in allowed}
+    return results, centered
+
+
+def _save_core_progress(
+    progress_path: str,
+    model_slug: str,
+    max_per_task: int,
+    results: dict,
+    centered_results: dict,
+    total_tasks: int,
+):
+    """Atomically persist current CORE progress to disk."""
+    os.makedirs(os.path.dirname(progress_path), exist_ok=True)
+    payload = {
+        "progress_version": 1,
+        "model_slug": model_slug,
+        "max_per_task": max_per_task,
+        "tasks_completed": len(results),
+        "tasks_total": total_tasks,
+        "results": results,
+        "centered_results": centered_results,
+    }
+    tmp_path = progress_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+    os.replace(tmp_path, progress_path)
+
+
+def evaluate_core(model, tokenizer, device, model_slug=None, max_per_task=-1):
     """
     Evaluate a base model on the CORE benchmark.
     Returns dict with results, centered_results, and core_metric.
@@ -134,12 +185,23 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1):
             random_baseline = row['Random baseline']
             random_baselines[task_name] = float(random_baseline)
 
-    # Evaluate each task
-    results = {}
-    centered_results = {}
+    # Evaluate each task (resumable)
+    if model_slug is None:
+        model_slug = "base_model_core"
+
+    task_labels = [task["label"] for task in tasks]
+    progress_path = _core_progress_path(base_dir, model_slug, max_per_task)
+    results, centered_results = _load_core_progress(progress_path, task_labels)
+    if results:
+        print0(f"[core] Resuming from progress: {len(results)}/{len(tasks)} tasks ({progress_path})")
+
     for task in tasks:
         start_time = time.time()
         label = task['label']
+        if label in results and label in centered_results:
+            print0(f"Skipping: {label} (already completed)")
+            continue
+
         task_meta = {
             'task_type': task['icl_task_type'],
             'dataset_uri': task['dataset_uri'],
@@ -165,12 +227,14 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1):
         centered_results[label] = centered_result
         elapsed = time.time() - start_time
         print0(f"accuracy: {accuracy:.4f} | centered: {centered_result:.4f} | time: {elapsed:.2f}s")
+        _save_core_progress(progress_path, model_slug, max_per_task, results, centered_results, total_tasks=len(tasks))
 
     core_metric = sum(centered_results.values()) / len(centered_results)
     out = {
         "results": results,
         "centered_results": centered_results,
-        "core_metric": core_metric
+        "core_metric": core_metric,
+        "progress_path": progress_path,
     }
     return out
 
@@ -288,7 +352,7 @@ def main():
         print0("CORE Evaluation")
         print0("="*80)
         with autocast_ctx:
-            core_results = evaluate_core(model, tokenizer, device, max_per_task=args.max_per_task)
+            core_results = evaluate_core(model, tokenizer, device, model_slug=model_slug, max_per_task=args.max_per_task)
 
         # Write CSV output
         if ddp_rank == 0:
@@ -303,6 +367,7 @@ def main():
                     f.write(f"{label:<35}, {acc:<10.6f}, {centered:<10.6f}\n")
                 f.write(f"{'CORE':<35}, {'':<10}, {core_results['core_metric']:<10.6f}\n")
             print0(f"\nResults written to: {output_csv_path}")
+            print0(f"CORE progress file: {core_results['progress_path']}")
             print0(f"CORE metric: {core_results['core_metric']:.4f}")
 
     # --- Log to report ---

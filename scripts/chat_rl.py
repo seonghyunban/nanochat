@@ -75,7 +75,12 @@ autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype) if dev
 
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
-wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-rl", name=args.run, config=user_config)
+wandb_project = os.environ.get("WANDB_PROJECT", "490-autobook-a4")
+wandb_run = (
+    DummyWandb()
+    if use_dummy_wandb
+    else wandb.init(project=wandb_project, name=args.run, config=user_config)
+)
 
 # Init model and tokenizer
 model, tokenizer, meta = load_model("sft", device, phase="eval", model_tag=args.model_tag, step=args.model_step)
@@ -355,7 +360,7 @@ for step in range(num_steps):
                 "model_config": model_config_kwargs,
             }
         )
-        print(f"✅ Saved model checkpoint to {checkpoint_dir}")
+        print(f"Saved model checkpoint to {checkpoint_dir}")
 
 # Log to report
 from nanochat.report import get_report

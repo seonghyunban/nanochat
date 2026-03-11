@@ -97,7 +97,11 @@ def download_file_with_lock(url, filename, postprocess_fn=None):
 def print0(s="",**kwargs):
     ddp_rank = int(os.environ.get('RANK', 0))
     if ddp_rank == 0:
-        print(s, **kwargs)
+        try:
+            print(s, flush=True, **kwargs)
+        except UnicodeEncodeError:
+            safe = str(s).encode("ascii", errors="backslashreplace").decode("ascii")
+            print(safe, flush=True, **kwargs)
 
 def print_banner():
     # Cool DOS Rebel font ASCII banner made with https://manytools.org/hacker-tools/ascii-banner/
@@ -110,6 +114,16 @@ def print_banner():
      ░███ ░███  ███░░███  ░███ ░███ ░███ ░███░███  ███ ░███ ░███  ███░░███  ░███ ███
      ████ █████░░████████ ████ █████░░██████ ░░██████  ████ █████░░███████  ░░█████
     ░░░░ ░░░░░  ░░░░░░░░ ░░░░ ░░░░░  ░░░░░░   ░░░░░░  ░░░░ ░░░░░  ░░░░░░░░   ░░░░░
+    """
+    print0(banner)
+
+def print_banner():
+    banner = """
+      _   _    _    _   _  ___   ____ _   _    _  _____
+     | \\ | |  / \\  | \\ | |/ _ \\ / ___| | | |  / \\|_   _|
+     |  \\| | / _ \\ |  \\| | | | | |   | |_| | / _ \\ | |
+     | |\\  |/ ___ \\| |\\  | |_| | |___|  _  |/ ___ \\| |
+     |_| \\_/_/   \\_\\_| \\_|\\___/ \\____|_| |_/_/   \\_\\_|
     """
     print0(banner)
 
