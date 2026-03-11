@@ -92,6 +92,9 @@ class GSM8K(Task):
         # Extract both the ground truth answer and the predicted answer
         ref_num = extract_answer(last_text_part)
         pred_num = extract_answer(assistant_response)
+        # Guard: if either extraction failed (None), treat as incorrect
+        if ref_num is None or pred_num is None:
+            return 0
         # Compare and return the success as int
         is_correct = int(pred_num == ref_num)
         return is_correct

@@ -193,6 +193,8 @@ def run_gsm8k_eval(task, tokenizer, engine,
     max_examples = min(max_examples, len(task)) if max_examples is not None else len(task)
     _eval_t0 = time.time()
     _eval_total = len(range(ddp_rank, max_examples, ddp_world_size))
+    if _eval_total == 0:
+        return
     _eval_done = 0
     for idx in range(ddp_rank, max_examples, ddp_world_size):
         conversation = task[idx]
@@ -390,7 +392,7 @@ for step in range(num_steps):
                 "model_config": model_config_kwargs,
             }
         )
-        print(f"Saved model checkpoint to {checkpoint_dir}")
+        print0(f"Saved model checkpoint to {checkpoint_dir}")
 
 # Log to report
 from nanochat.report import get_report
