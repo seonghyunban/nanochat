@@ -43,6 +43,7 @@ parser.add_argument("--model-tag", type=str, default=None, help="model tag to lo
 parser.add_argument("--model-step", type=int, default=None, help="model step to load from")
 # Training horizon
 parser.add_argument("--num-epochs", type=int, default=1, help="number of epochs over GSM8K")
+parser.add_argument("--num-iterations", type=int, default=-1, help="cap total training steps (-1 = no cap, use epochs)")
 # Batch sizes / sampling
 parser.add_argument("--device-batch-size", type=int, default=8, help="max batch size per forward pass")
 parser.add_argument("--examples-per-step", type=int, default=16, help="total examples per optimization step across all ranks")
@@ -101,6 +102,8 @@ print0(f"Reward components: {reward_names}")
 train_task = GSM8K(subset="main", split="train", reward_names=reward_names)
 val_task = GSM8K(subset="main", split="test")
 num_steps = (len(train_task) // args.examples_per_step) * args.num_epochs
+if args.num_iterations > 0:
+    num_steps = min(num_steps, args.num_iterations)
 print0(f"Calculated number of steps: {num_steps}")
 
 @torch.no_grad()
