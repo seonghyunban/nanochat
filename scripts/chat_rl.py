@@ -18,6 +18,7 @@ torchrun --standalone --nproc_per_node=8 -m scripts.chat_rl -- --run=default
 
 import argparse
 import os
+import time
 import itertools
 import wandb
 import torch
@@ -187,6 +188,9 @@ def run_gsm8k_eval(task, tokenizer, engine,
     Because the evaluation can take a while, this function will yield records one by one.
     """
     max_examples = min(max_examples, len(task)) if max_examples is not None else len(task)
+    _eval_t0 = time.time()
+    _eval_total = len(range(ddp_rank, max_examples, ddp_world_size))
+    _eval_done = 0
     for idx in range(ddp_rank, max_examples, ddp_world_size):
         conversation = task[idx]
         tokens = tokenizer.render_for_completion(conversation)
@@ -214,6 +218,11 @@ def run_gsm8k_eval(task, tokenizer, engine,
             "idx": idx,
             "outcomes": outcomes,
         }
+        _eval_done += 1
+        _eval_elapsed = time.time() - _eval_t0
+        _eval_pct = _eval_done / _eval_total * 100
+        _eval_eta = (_eval_elapsed / _eval_done) * (_eval_total - _eval_done)
+        print0(f"  [eval] {_eval_done}/{_eval_total} ({_eval_pct:.0f}%) | {_eval_elapsed:.0f}s elapsed | ~{_eval_eta:.0f}s remaining")
         yield record
 
 # -----------------------------------------------------------------------------
@@ -245,6 +254,17 @@ print0(f"Calculated examples per rank: {examples_per_rank}")
 
 # Kick off the training loop
 batch_iterator = get_batch()
+_train_t0 = time.time()
+_step_ema = None  # EMA of step duration (seconds), for smooth ETA
+_EMA_ALPHA = 0.1
+def _fmt_time(sec):
+    if sec < 60:
+        return f"{sec:.0f}s"
+    elif sec < 3600:
+        return f"{sec/60:.1f}m"
+    else:
+        h, m = divmod(sec, 3600)
+        return f"{int(h)}h{int(m/60):02d}m"
 for step in range(num_steps):
 
     # Evaluate the model once in a while and log to wandb
@@ -323,7 +343,15 @@ for step in range(num_steps):
             dist.all_reduce(t, op=dist.ReduceOp.AVG)
             mean_component_rewards[name] = t.item()
     component_str = " | ".join(f"{name}: {mean_component_rewards[name]:.4f}" for name in reward_names)
-    print0(f"Step {step}/{num_steps} | Average reward: {mean_reward} | {component_str} | Average sequence length: {mean_sequence_length:.2f}")
+    # Progress tracking with EMA-smoothed ETA
+    _now = time.time()
+    _elapsed = _now - _train_t0
+    _steps_done = step + 1
+    _pct = _steps_done / num_steps * 100
+    _step_dur = _elapsed / _steps_done
+    _step_ema = _step_dur if _step_ema is None else (1 - _EMA_ALPHA) * _step_ema + _EMA_ALPHA * _step_dur
+    _eta_sec = _step_ema * (num_steps - _steps_done)
+    print0(f"Step {step}/{num_steps} ({_pct:.1f}%) | reward: {mean_reward:.4f} | {component_str} | seq_len: {mean_sequence_length:.1f} | {_fmt_time(_elapsed)} elapsed | ~{_fmt_time(_eta_sec)} remaining")
     log_dict = {
         "step": step,
         "reward": mean_reward,
